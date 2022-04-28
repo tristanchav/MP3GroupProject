@@ -1,5 +1,5 @@
 CC := gcc
-LDFLAGS := -lssl -lcrypto
+LDFLAGS :=  `sdl2-config --cflags --libs` -lssl -lcrypto -lcrypt -lsqlite3 -lSDL2_mixer
 UNAME := $(shell uname)
 CERT := openssl req -newkey rsa:2048 -nodes -keyout key.pem -x509 -days 365 -out cert.pem
 SERVER := cd serverdata
