@@ -3,7 +3,7 @@
 PROGRAM:  server.c
 AUTHOR:   Tristan Chavez, Nhi La, Wega Kinoti
 COURSE:   CS469 - Distributed Systems (Regis University)
-SYNOPSIS: 
+SYNOPSIS: The server end for sending and authenticating for Mp3 files. Clears SQL database after closing
 
 ******************************************************************************/
 #include <fcntl.h>
@@ -16,11 +16,27 @@ SYNOPSIS:
 #include <sys/socket.h>
 #include <openssl/ssl.h>
 #include <openssl/err.h>
+#include <crypt.h>
+#include <termios.h>
+#include <stdlib.h>
+#include <time.h>
+#include <sqlite3.h>
+
+#include <stdlib.h>
+#include <dirent.h>
+#include <errno.h>
 
 #define BUFFER_SIZE       256
+#define PATHLENGTH        256
 #define DEFAULT_PORT      4433
 #define CERTIFICATE_FILE  "cert.pem"
 #define KEY_FILE          "key.pem"
+#define SEED_LENGTH       8
+#define PASSWORD_LENGTH   32
+
+#define ERR_TOO_FEW_ARGS  1
+#define ERR_TOO_MANY_ARGS 2
+#define ERR_INVALID_OP    3
 
 /******************************************************************************
 
@@ -186,12 +202,57 @@ void configure_context(SSL_CTX* ssl_ctx)
       }
 }
 
+static int callback(void* data, int argc, char** argv, char** azColName)
+{
+    int i;
+  
+    for (i = 0; i < argc; i++) {
+        printf("%s = %s\n", azColName[i], argv[i] ? argv[i] : "NULL");
+    }
+  
+    printf("\n");
+    return 0;
+}
+
+static int lookup(void* data, int argc, char** argv, char** azColName)
+{
+    int *i = (int*)data;
+  
+    *i = 1;
+    //printf("FOUND\n"); debug
+    return 0;
+}
+
 int main(int argc, char **argv)
 {
     SSL_CTX*     ssl_ctx;
     unsigned int sockfd;
     unsigned int port;
-    char         buffer[BUFFER_SIZE];
+
+    char         filename[PATHLENGTH];
+    char         extra[PATHLENGTH];
+    
+    struct dirent* currentEntry;
+    struct stat    fileInfo;
+    char           olddir[PATHLENGTH];
+    char           dirname[PATHLENGTH];
+    DIR*           d;
+    int            sentinal;
+    sqlite3*           DB;
+    char         password[PASSWORD_LENGTH];
+    char	 username[BUFFER_SIZE];
+    char	 verifyUsername[BUFFER_SIZE];
+    char         hash[BUFFER_SIZE];
+    char         verifyHash[BUFFER_SIZE];
+    char         verifyPassword[PASSWORD_LENGTH];
+    char         *seedchars = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
+    char         salt[] = "$5$........";
+
+    srand(time(0));
+
+    // Convert the salt into printable characters from the seedchars string
+    for (int i = 0; i < SEED_LENGTH; i++)
+      salt[3+i] = seedchars[rand() % strlen(seedchars)];
 
     // Initialize and create SSL data structures and algorithms
     init_openssl();
@@ -225,11 +286,21 @@ int main(int argc, char **argv)
 	int                client;
 	int                readfd;
 	int                rcount;
+        int                wcount;
         const  char        reply[] = "Hello World!";
         struct sockaddr_in addr;
         unsigned int       len = sizeof(addr);
 	char               client_addr[INET_ADDRSTRLEN];
-	
+        sqlite3_stmt       *res;
+        int                exitError = 0;
+        int                id = 1;
+        int                queryFound = 0;
+        char               sqldb[] = "CREATE TABLE IF NOT EXISTS USERS(\nID INTEGER PRIMARY KEY,\n NAME TEXT NOT NULL,\n PASSWORD TEXT NOT NULL);";
+	char*              messageError;
+        char               select[BUFFER_SIZE];
+        char               buffer[BUFFER_SIZE];
+        char               insert[BUFFER_SIZE];
+
 	// Once an incoming connection arrives, accept it.  If this is successful, we
 	// now have a connection between client and server and can communicate using
 	// the socket descriptor
@@ -263,21 +334,230 @@ int main(int argc, char **argv)
           }
         else
 	  fprintf(stdout, "Server: Established SSL/TLS connection with client (%s)\n", client_addr);
-
-	// ************************************************************************
-	// NEW CODE HERE
-	// ************************************************************************
-
 	
-        // File transfer complete
-	fprintf(stdout, "Server: Completed file transfer to client (%s)\n", client_addr);
-	    
-	// Terminate the SSL session, close the TCP connection, and clean up
-	fprintf(stdout, "Server: Terminating SSL session and TCP connection with client (%s)\n", client_addr);
+        char x[BUFFER_SIZE], y[BUFFER_SIZE];
+        bzero(buffer, BUFFER_SIZE);
+
+        // Opens database with error checking
+        exitError = sqlite3_open("users.db", &DB);
+        
+        if (exitError) {
+          fprintf(stderr, "Server: ERROR: opening database\nSQL: %s\n", messageError);
+          return (-1);
+        }
+        else
+          fprintf(stdout, "Server: Opened database successfully\n");
+
+        //Creates sql table
+        exitError = sqlite3_exec(DB, sqldb, NULL, 0, &messageError);
+  
+        if (exitError != SQLITE_OK) {
+          fprintf(stderr, "Server: ERROR: creating table\nSQL: %s\n", messageError);
+          sqlite3_free(messageError);
+        }
+        else
+          fprintf(stdout, "Server: Table created successfully\n");
+
+        // Runs code for startup procedures
+        do {
+          bzero(buffer, BUFFER_SIZE);
+          rcount = SSL_read(ssl, buffer, BUFFER_SIZE);
+          //fprintf(stderr, "%s\n", buffer); debug
+
+          //Sign in procedures
+          if (sscanf(buffer, "SIGNIN %s %s", x, y) == 2) {
+            fprintf(stdout, "Server: Signing in to Previous Account\n");
+            strncpy(verifyHash, crypt(y, salt), BUFFER_SIZE);
+            //fprintf(stdout, "%s\n", x); debug
+            //fprintf(stdout, "%s\n", y); debug
+            //fprintf(stdout, "%s\n", verifyHash); debug
+            snprintf(select, BUFFER_SIZE*3, "SELECT NAME FROM USERS WHERE NAME=\"%s\" AND PASSWORD=\"%s\";", x, verifyHash);
+            //fprintf(stdout, "%s\n", select); debug
+            bzero(buffer, BUFFER_SIZE);
+
+            int rc = sqlite3_exec(DB, select, lookup, &queryFound, &messageError);
+  
+            if (rc != SQLITE_OK) {
+              fprintf(stderr, "ERROR: SELECT %s\n", messageError);
+              wcount = SSL_write(ssl, "ERROR: SERVER: SQL SELECT error, please try again.", BUFFER_SIZE);
+            }
+            else {
+              if (queryFound == 1) {
+                fprintf(stdout, "Server: Signed in user: %s\n", x);
+                wcount = SSL_write(ssl, x, BUFFER_SIZE);
+              }
+              else {
+                fprintf(stdout, "Server: User: %s not found\n", x);
+                wcount = SSL_write(ssl, "ERROR: SIGNINWRONG", BUFFER_SIZE);
+              }
+            }
+            
+            queryFound = 0;
+            //char query[BUFFER_SIZE] = "SELECT * FROM USERS;"; debug
+            //sqlite3_exec(DB, query, callback, NULL, NULL); debug
+          }
+          
+          // Create account procedures
+          else if (sscanf(buffer, "CREATE %s %s", x, y) == 2) {
+            fprintf(stderr, "Server: Creating New Account\n");
+            //fprintf(stdout, "%s\n", x); debug
+            strncpy(hash, crypt(y, salt), BUFFER_SIZE);
+            //fprintf(stdout, "%s\n", y); debug
+            //fprintf(stdout, "%s\n", hash); debug
+            bzero(buffer, BUFFER_SIZE);
+
+            
+            // Checks if username or password has already been used
+            snprintf(select, BUFFER_SIZE*3, "SELECT NAME FROM USERS WHERE NAME=\"%s\" OR PASSWORD=\"%s\";", x, hash);
+            //fprintf(stdout, "%s\n", select); debug
+            int rc = sqlite3_exec(DB, select, lookup, &queryFound, &messageError);
+  
+            if (rc != SQLITE_OK) {
+              fprintf(stderr, "Server: ERROR: SELECT %s\n", messageError);
+              wcount = SSL_write(ssl, "ERROR: SERVER: SQL SELECT error, please try again.", BUFFER_SIZE);
+            }
+            else {
+              //fprintf(stdout, "Operation OK!\n"); debug
+              // If the name or password has not been used yet
+              if (queryFound == 0) {
+                //Code to insert new values
+                snprintf(insert, BUFFER_SIZE*3, "INSERT INTO USERS(NAME, PASSWORD) VALUES(\"%s\", \"%s\");", x, hash);
+               //fprintf(stdout, "%s\n", insert); debug
+
+                exitError = sqlite3_exec(DB, insert, NULL, 0, &messageError);
+                if (exitError != SQLITE_OK) {
+                  fprintf(stderr, "Server: ERROR: inserting to table\nSQL: %s\n", messageError);
+                  sqlite3_free(messageError);
+                  wcount = SSL_write(ssl, "ERROR: SERVER: SQL SELECT error, please try again.", BUFFER_SIZE);
+                }
+                else {
+                  fprintf(stdout, "Server: Records created successfully\n");
+                  wcount = SSL_write(ssl, x, BUFFER_SIZE);
+                }
+              }
+              else {
+                fprintf(stdout, "Server: Username or password already taken\n");
+                wcount = SSL_write(ssl, "ERROR: TAKEN", BUFFER_SIZE);
+              }
+            }
+            queryFound = 0;
+            //char query[BUFFER_SIZE] = "SELECT * FROM USERS;"; debug
+            //sqlite3_exec(DB, query, callback, NULL, NULL); debug
+          }
+        } while (strncmp(buffer, "CANCEL", 9) != 0 && strncmp(buffer, "LOGGED IN", 9) != 0);
+
+        if(strncmp(buffer, "LOGGED IN", 9) == 0) {
+          //************************Directory Listing Stuff****************************
+          if (argc == 1) {
+            strncpy(dirname, ".", 2);
+          } else {
+            strncpy(dirname, argv[1], PATHLENGTH);
+            chdir(dirname);
+          }
+
+          // Save the current working directory so that stat will work properly
+          // when getting the size in bytes of files in a different directory
+          getcwd(olddir, PATHLENGTH);
+
+          // Open the directory and check for error, if error send sentinal value to client showing error
+          d = opendir(dirname);
+          if (d == NULL) {
+            fprintf(stderr, "Could not open directory %s: %s\n", dirname, strerror(errno));
+              sentinal = -1;
+            return sentinal;
+          }
+
+          // Change to the directory being listed so that the calls to stat on each
+          // directory entry will work correctly
+          chdir(dirname);
+          
+          // Read each entry in the directory and display name and size
+          currentEntry = readdir(d);
+          
+          // Iterate through all directory entries
+         
+          while(currentEntry != NULL) {
+            
+            // Use stat to get the size of the file in bytes.  If the program is listing
+            // a directory other than the working directory of this program, the stat
+            // call here will not work properly since d_name is relative
+            if (stat(currentEntry->d_name, &fileInfo) < 0)
+              fprintf(stderr, "stat: %s: %s\n", currentEntry->d_name, strerror(errno));
+
+            // Check to see if the item is a subdirectory
+            if (S_ISDIR(fileInfo.st_mode)) {
+              fprintf(stdout, "%-30s\t<dir>\n", currentEntry->d_name);
+            } else {
+              fprintf(stdout, "%-30s\t%lu bytes\n", currentEntry->d_name, fileInfo.st_size);
+            }
+
+            // Get the next directory entry
+            currentEntry = readdir(d);
+          }
+
+          // Change back to the original directory from where the program was invoked
+          chdir(olddir);
+          
+          closedir(d);
+
+          // **********************Sending File**************************************
+	  // Receive RPC request and transfer the file
+          bzero(buffer, BUFFER_SIZE);
+          rcount = SSL_read(ssl, buffer, BUFFER_SIZE);
+
+          // Check for invalid operation by comparing the first 9 chars to "download "
+          if (strncmp(buffer, "download ", 9) != 0) {
+            sprintf(buffer, "rpcerror %d", ERR_INVALID_OP);
+            SSL_write(ssl, buffer, strlen(buffer) + 1);
+          }
+
+          // Check for too many parameters
+          else if (sscanf(buffer, "download %s %s", filename, extra) == 2) {
+            sprintf(buffer, "rpcerror %d", ERR_TOO_MANY_ARGS);
+            SSL_write(ssl, buffer, strlen(buffer) + 1);
+          }
+
+          // Check for too few parameters
+          else if (sscanf(buffer, "download %s", filename) != 1) {
+            sprintf(buffer, "rpcerror %d", ERR_TOO_FEW_ARGS);
+            SSL_write(ssl, buffer, strlen(buffer) + 1);
+          }
+  
+          // Check for the correct number of parameters
+          else if (sscanf(buffer, "download %s", filename) == 1) {
+
+            // Now check for a file error
+            readfd = open(filename, O_RDONLY);
+            if (readfd < 0) {
+              fprintf(stderr, "Server: Could not open file \"%s\": %s\n", filename, strerror(errno));
+              sprintf(buffer, "fileerror %d", errno);
+              SSL_write(ssl, buffer, strlen(buffer) + 1);
+            }
+
+            // Passed all error checks, so transfer the file contents to the client
+            else {
+              do {
+                rcount = read(readfd, buffer, BUFFER_SIZE);
+                SSL_write(ssl, buffer, rcount);
+              } while (rcount > 0);
+              close(readfd);
+              // ************************************************************************
+
+              // File transfer complete
+              fprintf(stdout, "Server: Completed file transfer to client (%s)\n", client_addr);
+            }
+          }  
+        fprintf(stdout, "Server: Completed with client (%s)\n", client_addr);
+        // Terminate the SSL session, close the TCP connection, and clean up
+        fprintf(stdout, "Server: Terminating SSL session and TCP connection with client (%s)\n", client_addr);
+        sqlite3_close(DB);
         SSL_free(ssl);
         close(client);
-    }
-
+        }
+      }
+    //Tear down SQL before terminating
+    sqlite3_exec(DB, "DELETE FROM USERS;", NULL, 0, NULL);
+    sqlite3_exec(DB, "DROP TABLE USERS;", NULL, 0, NULL);
     // Tear down and clean up server data structures before terminating
     SSL_CTX_free(ssl_ctx);
     cleanup_openssl();
