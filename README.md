@@ -2,10 +2,10 @@
 Authenticates the user then opens and plays an MP3 audio file given as a command line argument.
 /           Also outputs artist, title, album, and year information saved in
 /           the 128-byte ID3 tag at the end of the file (ID3v1).
-/
+/           
 /           To build the play part of the program, you must install both the libsdl2-dev library
 /           as well as the SDL2_mixer library:
-/
+/           
 /           sudo apt-get install -y libsdl2-dev libsdl2-mixer-2.0-0 libsdl2-mixer-dev
 /           
 /           To build the SQLite3 database part, you must install the SQLite3 library
